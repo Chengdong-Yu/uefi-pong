@@ -8,7 +8,7 @@ Nothing Phone (2)（代号 **Pong**，SoC **SM8475**）的 UEFI 固件源码。�
 
 Pong 平台使用 ARM64 和高通 SM8475 配置，显示缓冲区为 1080 × 2412，并使用 Pong 设备树。板级文件位于 `Platforms/Nothing/pongPkg`。UniXNU 与 DarwinBoot 的应用和驱动集成已加入 Pong 的 DSC/FDF 配置。
 
-仓库仅包含固件源码和构建脚本，不包含 Apple restore 组件或构建生成的固件、启动镜像。需要的 iOS 16.6.1 / 20G81 组件由配套的 [UniXNU-pong 设备仓库](https://github.com/Chengdong-Yu/UniXNU-pong)按需获取。
+仓库仅包含固件源码和构建脚本，不包含 Apple restore 组件或构建生成的固件、启动镜像。
 
 ## 资源
 
