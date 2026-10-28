@@ -175,7 +175,10 @@ def update_local_repo () -> bool:
         return False
 
     # Update Submodules
-    if not subprocess.run (["git", "submodule", "update"]).returncode == 0:
+    # "Mu_Basecore" carries Nested Submodules (Oniguruma, libfdt, MipiSysT, libspdm, ...)
+    # that "MdePkg.dec" and "MdeModulePkg" list in their Include/Include Paths,
+    # so a Non-Recursive Update leaves the Build Failing with "File/directory not found".
+    if not subprocess.run (["git", "submodule", "update", "--init", "--recursive"]).returncode == 0:
         return False
 
     return True
@@ -327,10 +330,20 @@ def create_android_boot_img (ctx: BuildContext, image_kernel_config: dict, image
     # Set Base mkbootimg Command
     cmd = [
         sys.executable, str (mkbootimg),
-        "--kernel",     str (android_kernel),
-        "--ramdisk",    "Resources/ramdisk",
-        "-o",           output_file_name
+        "--kernel",     str (android_kernel)
     ]
+
+    # Attach the Ramdisk only when the User Provided one
+    # "mkbootimg.py" treats a missing "--ramdisk" as an empty Ramdisk (Size = 0),
+    # while passing a Nonexistent Path to "--ramdisk" makes argparse Fail.
+    ramdisk_path = Path ("Resources/ramdisk")
+    if ramdisk_path.is_file ():
+        cmd += ["--ramdisk", str (ramdisk_path)]
+    else:
+        logger.warning (f"No Ramdisk Found in \"{ramdisk_path}\", Building a Ramdisk-Less Boot Image!")
+
+    # Set the Output Path
+    cmd += ["-o", output_file_name]
 
     # mkbootimg Argument Map
     argument_map = {

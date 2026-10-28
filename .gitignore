@@ -1,7 +1,8 @@
 # Local firmware products and input data are always generated or fetched.
 Build/
 out/
-Conf/.cache/
+Conf/
+BootShim/BootShim.bin
 *.fd
 *.elf
 *.efi
