@@ -10,7 +10,9 @@
   INF MdeModulePkg/Application/BootManagerMenuApp/BootManagerMenuApp.inf
   INF PcBdsPkg/MsBootPolicy/MsBootPolicy.inf
   INF SiliciumPkg/Applications/UFPLoader/UFPLoader.inf
+!ifdef ENABLE_UFP_FACTORY
   INF SiliciumPkg/Applications/UFP/ufpdevicefw.inf
+!endif
 
   #
   # RAW Files
