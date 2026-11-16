@@ -1,0 +1,18 @@
+## SPDX-License-Identifier: BSD-2-Clause-Patent
+[Defines]
+  INF_VERSION = 0x00010005
+  BASE_NAME = ThorSmokePlatformSecLib
+  FILE_GUID = C9CD922B-6407-4BC0-BC6E-A25F9FE4279E
+  MODULE_TYPE = SEC
+  VERSION_STRING = 0.1
+  LIBRARY_CLASS = PlatformSecLib
+[Sources]
+  PlatformSec.c
+[Sources.AArch64]
+  AArch64/PlatformHelper.S
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdePkg/MdePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+[LibraryClasses]
+  CacheMaintenanceLib
