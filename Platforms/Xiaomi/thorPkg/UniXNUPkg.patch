@@ -1,0 +1,699 @@
+diff --git a/UniXNUPkg/Application/UniXNU/UniXNU.c b/UniXNUPkg/Application/UniXNU/UniXNU.c
+--- a/UniXNUPkg/Application/UniXNU/UniXNU.c
++++ b/UniXNUPkg/Application/UniXNU/UniXNU.c
+@@ -17,6 +17,8 @@
+ //
+ STATIC CONST CHAR16  mFirmwareMarker[] = L"unixnu:firmware";
+
++// THOR: BLUE bar when the UniXNU menu starts (DXE + BDS complete).
++
+ EFI_STATUS
+ EFIAPI
+ UniXNUApplicationEntry (
+@@ -24,9 +26,20 @@
+   IN EFI_SYSTEM_TABLE  *SystemTable
+   )
+ {
++  // THOR: direct framebuffer bar — proves the app was launched by BDS
++  {
++    volatile UINT32 *F = (volatile UINT32 *)(UINTN)0xB8000000ULL;
++    for (UINTN i = 0; i < 1440 * 64; ++i) { F[512 * 1440 + i] = 0x00FF00; }
++  }
++  // THOR: GREEN bar when UniXNU menu starts (all DXE drivers dispatched)
++  {
++    volatile UINT32 *F = (volatile UINT32 *)(UINTN)0xB8000000ULL;
++    for (UINTN i = 0; i < 1440 * 64; ++i) F[192 * 1440 + i] = 0x00FF00;
++  }
+   EFI_LOADED_IMAGE_PROTOCOL  *Loaded;
+   UNIXNU_HOST             Host;
+   EFI_STATUS                 Status;
++
+
+   Host = UniXNUHostApplication;
+   if (!EFI_ERROR (gBS->HandleProtocol (ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Loaded)) &&
+diff --git a/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c b/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
+--- a/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
++++ b/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
+@@ -10,9 +10,55 @@
+ #include <Library/DebugLib.h>
+ #include <Library/FdtLib.h>
+ #include <Library/HobLib.h>
++#include <Library/MemoryAllocationLib.h>
+ #include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiLib.h>
+ #include <Protocol/BlockIo.h>
+ #include <Protocol/DevicePath.h>
++
++//
++// THOR: this ABL does not describe the initrd in /chosen (the upstream driver
++// then silently publishes nothing and the menu falls back to the built-in
++// config). Scan for our FAT16 payload by boot-sector signature instead.
++// The scan follows the UEFI memory map so only ranges the firmware knows are
++// RAM are touched — an unmapped page would take a synchronous exception.
++// The window covers the whole ABL load area around the FD at 0xA7100000
++// (kernel blob, ramdisk and DTB land anywhere in it).
++//
++#define THOR_SCAN_BASE  0xA7000000UL
++#define THOR_SCAN_END   0xC0000000UL
++
++STATIC
++BOOLEAN
++IsRamType (
++  IN UINT32  Type
++  )
++{
++  switch (Type) {
++    case EfiLoaderCode:
++    case EfiLoaderData:
++    case EfiBootServicesCode:
++    case EfiBootServicesData:
++    case EfiConventionalMemory:
++    case EfiRuntimeServicesCode:
++    case EfiRuntimeServicesData:
++    case EfiReservedMemoryType:
++      return TRUE;
++    default:
++      return FALSE;
++  }
++}
++
++STATIC
++VOID
++RdSay (
++  IN CONST CHAR16  *Text
++  )
++{
++  if ((gST != NULL) && (gST->ConOut != NULL)) {
++    gST->ConOut->OutputString (gST->ConOut, (CHAR16 *)Text);
++  }
++}
+
+ // Mu-Silicium SEC stores the incoming x0 value in this HOB as a UINT64.
+ STATIC CONST EFI_GUID mEntryArgHobGuid = {
+@@ -129,41 +175,30 @@
+ };
+
+ STATIC
+-VOID
+-PublishInitrd (
+-  IN CONST VOID  *Fdt
++EFI_STATUS
++PublishRange (
++  IN UINT64  Start,
++  IN UINT64  End
+   )
+ {
+   EFI_STATUS  Status;
+-  INT32       Chosen;
+-  CONST VOID  *StartProp;
+-  CONST VOID  *EndProp;
+-  INT32       StartLength;
+-  INT32       EndLength;
+-  UINT64      Start;
+-  UINT64      End;
+   EFI_HANDLE  Handle;
+
+-  Chosen = FdtPathOffset (Fdt, "/chosen");
+-  if (Chosen < 0) {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no /chosen\n"));
+-    return;
+-  }
+-
+-  StartProp = FdtGetProp (Fdt, Chosen, "linux,initrd-start", &StartLength);
+-  EndProp   = FdtGetProp (Fdt, Chosen, "linux,initrd-end", &EndLength);
+-  if ((StartProp == NULL) || (EndProp == NULL) ||
+-      ((StartLength != 4) && (StartLength != 8)) || ((EndLength != 4) && (EndLength != 8)))
+-  {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no initrd in /chosen\n"));
+-    return;
+-  }
+-
+-  Start = ReadCells (StartProp, StartLength / 4);
+-  End   = ReadCells (EndProp, EndLength / 4);
+-  if ((End <= Start) || (((End - Start) % RAM_BLOCK_SIZE) != 0)) {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd 0x%lx-0x%lx is not a whole number of sectors\n", Start, End));
+-    return;
++  if (End <= Start) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  //
++  // The bootloader does not always end the initrd on a sector boundary: the
++  // nubia NX769J hands over an end address whose low bits are 0x430. Round the
++  // published length up instead of refusing the ramdisk; the bytes between the
++  // real end and the rounded end are inside the RAM the bootloader reserved for
++  // the initrd, and the volume is read-only.
++  //
++  if (((End - Start) % RAM_BLOCK_SIZE) != 0) {
++    UINT64  Rounded = ((End - Start) + RAM_BLOCK_SIZE - 1) / RAM_BLOCK_SIZE * RAM_BLOCK_SIZE;
++
++    End = Start + Rounded;
+   }
+
+   mRamBase                = (UINT8 *)(UINTN)Start;
+@@ -186,7 +221,226 @@
+                   &mBlockIo,
+                   NULL
+                   );
+-  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd block device 0x%lx size 0x%lx %r\n", Start, End - Start, Status));
++  Print (L"UNIXNURAMDISK: payload 0x%lx-0x%lx (%lu MiB) block device %r\n",
++    Start, End, (End - Start) >> 20, Status);
++  return Status;
++}
++
++//
++// Claim the payload's pages so later DXE pool allocations cannot clobber
++// the ABL staging area the payload lives in. AllocateAddress keeps the
++// contents and just marks the range owned; if it fails the payload is in
++// memory the firmware never hands out, which is also fine.
++//
++STATIC
++VOID
++ThorProtectRange (
++  IN UINT64  Start,
++  IN UINT64  Size
++  )
++{
++  EFI_STATUS            Status;
++  EFI_PHYSICAL_ADDRESS  Base;
++  UINTN                 Pages;
++
++  Base  = Start & ~0xFFFULL;
++  Pages = (UINTN)(((Size + (Start - Base)) + 0xFFF) / 0x1000);
++  Status = gBS->AllocatePages (AllocateAddress, EfiBootServicesData, Pages, &Base);
++  Print (L"UNIXNURAMDISK: protect 0x%lx +0x%lx pages %u -> %r\r\n",
++    Base, (UINT64)Pages * 0x1000, (UINT32)Pages, Status);
++}
++
++//
++// Read the first sector back through the published BlockIo so the on-screen
++// log proves the device serves the payload bytes we scanned for.
++//
++STATIC
++VOID
++ThorSelfTest (
++  VOID
++  )
++{
++  UINT8  Sector[512];
++
++  if (mRamBase == NULL) {
++    return;
++  }
++
++  if (EFI_ERROR (RamBlockRead (&mBlockIo, mMedia.MediaId, 0, sizeof (Sector), Sector))) {
++    RdSay (L"UNIXNURAMDISK: selftest read FAILED\r\n");
++    return;
++  }
++
++  if ((Sector[510] == 0x55) && (Sector[511] == 0xAA) &&
++      (CompareMem (Sector + 0x2B, "UNIXNU", 6) == 0))
++  {
++    RdSay (L"UNIXNURAMDISK: selftest OK (label visible through BlockIo)\r\n");
++  } else {
++    RdSay (L"UNIXNURAMDISK: selftest MISMATCH - payload memory was clobbered\r\n");
++  }
++}
++
++//
++// Locate our FAT16 payload inside a bootloader-declared range: the ABL
++// initrd span also carries its own generic ramdisk content, so /chosen
++// start is NOT the FAT boot sector. 1029's payload verify (KMP search for
++// the THOR-PAYLOAD04 magic) proved on this device that the payload sits at
++// an arbitrary BYTE offset inside the span — so scan at 4-byte steps, not
++// sector steps. A hit does not need any alignment: BlockIo reads are
++// plain memory copies from the found address.
++//
++STATIC
++UINT64
++ScanRangeForFat (
++  IN  UINT64  Start,
++  IN  UINT64  End,
++  OUT UINT64  *Size
++  )
++{
++  UINT8   *Block;
++  UINT16  BytesPerSector;
++  UINT32  TotalSectors;
++
++  *Size = 0;
++
++  for (UINT64 Addr = Start; Addr + 512 <= End; Addr += 1) {
++    Block = (UINT8 *)(UINTN)Addr;
++    if ((Block[510] != 0x55) || (Block[511] != 0xAA)) {
++      continue;
++    }
++
++    if (CompareMem (Block + 0x2B, "UNIXNU", 6) != 0) {
++      continue;
++    }
++
++    BytesPerSector = (UINT16)(Block[0x0B] | (Block[0x0C] << 8));
++    TotalSectors   = (UINT16)(Block[0x13] | (Block[0x14] << 8));
++    if (TotalSectors == 0) {
++      TotalSectors = (UINT32)(Block[0x20] | (Block[0x21] << 8) |
++                              (Block[0x22] << 16) | (Block[0x23] << 24));
++    }
++
++    if ((BytesPerSector != RAM_BLOCK_SIZE) || (TotalSectors == 0) || (TotalSectors > 0x100000)) {
++      continue;
++    }
++
++    *Size = (UINT64)TotalSectors * RAM_BLOCK_SIZE;
++    return Addr;
++  }
++
++  return 0;
++}
++
++//
++// Look for our FAT16 payload by boot-sector signature inside the RAM the
++// firmware's own memory map describes: 0x55AA at 510 and the UNIXNU volume
++// label. The BPB supplies the true length, so the payload size may change
++// without touching this driver.
++//
++STATIC
++BOOLEAN
++ScanFatPayload (
++  VOID
++  )
++{
++  UINTN                  MapSize;
++  UINTN                  MapKey;
++  UINTN                  DescriptorSize;
++  UINT32                 DescriptorVersion;
++  EFI_MEMORY_DESCRIPTOR  *Map;
++  EFI_STATUS             Status;
++  UINT8                  *Block;
++  UINT16                 BytesPerSector;
++  UINT32                 TotalSectors;
++  UINT64                 Size;
++  UINT64                 Start;
++  UINT64                 End;
++
++  RdSay (L"UNIXNURAMDISK: memory-map scan for FAT payload...\r\n");
++
++  MapSize = 0;
++  Map     = NULL;
++  Status  = gBS->GetMemoryMap (&MapSize, Map, &MapKey, &DescriptorSize, &DescriptorVersion);
++  if (Status != EFI_BUFFER_TOO_SMALL) {
++    RdSay (L"UNIXNURAMDISK: GetMemoryMap failed\r\n");
++    return FALSE;
++  }
++
++  Map = AllocatePool (MapSize + 2 * DescriptorSize);
++  if (Map == NULL) {
++    return FALSE;
++  }
++
++  Status = gBS->GetMemoryMap (&MapSize, Map, &MapKey, &DescriptorSize, &DescriptorVersion);
++  if (EFI_ERROR (Status)) {
++    FreePool (Map);
++    RdSay (L"UNIXNURAMDISK: GetMemoryMap retry failed\r\n");
++    return FALSE;
++  }
++
++  for (UINTN Off = 0; Off < MapSize; Off += DescriptorSize) {
++    EFI_MEMORY_DESCRIPTOR  *D = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Off);
++
++    if (!IsRamType (D->Type)) {
++      continue;
++    }
++
++    Start = D->PhysicalStart;
++    End   = Start + (UINT64)D->NumberOfPages * EFI_PAGE_SIZE;
++    if (End <= THOR_SCAN_BASE) {
++      continue;
++    }
++
++    if (Start < THOR_SCAN_BASE) {
++      Start = THOR_SCAN_BASE;
++    }
++
++    if (End > THOR_SCAN_END) {
++      End = THOR_SCAN_END;
++    }
++
++    //
++    // Only whole 512-byte blocks inside this RAM descriptor are examined.
++    //
++    Start = (Start + RAM_BLOCK_SIZE - 1) & ~((UINT64)RAM_BLOCK_SIZE - 1);
++    for (UINT64 Addr = Start; Addr + 512 <= End; Addr += RAM_BLOCK_SIZE) {
++      Block = (UINT8 *)(UINTN)Addr;
++      if ((Block[510] != 0x55) || (Block[511] != 0xAA)) {
++        continue;
++      }
++
++      //
++      // macOS newfs_msdos writes "BSD  4.4" as the OEM name (not "MSDOS5.0"),
++      // so the volume label is the reliable marker of our payload.
++      //
++      if (CompareMem (Block + 0x2B, "UNIXNU", 6) != 0) {
++        continue;
++      }
++
++      BytesPerSector = (UINT16)(Block[0x0B] | (Block[0x0C] << 8));
++      TotalSectors   = (UINT16)(Block[0x13] | (Block[0x14] << 8));
++      if (TotalSectors == 0) {
++        TotalSectors = (UINT32)(Block[0x20] | (Block[0x21] << 8) |
++                                (Block[0x22] << 16) | (Block[0x23] << 24));
++      }
++
++      if ((BytesPerSector != RAM_BLOCK_SIZE) || (TotalSectors == 0) || (TotalSectors > 0x100000)) {
++        Print (L"UNIXNURAMDISK: FAT signature at 0x%lx but bad geometry (%u x %u)\r\n",
++          Addr, BytesPerSector, TotalSectors);
++        continue;
++      }
++
++      Size = (UINT64)TotalSectors * RAM_BLOCK_SIZE;
++      Print (L"UNIXNURAMDISK: FAT payload found at 0x%lx in %a memory\r\n",
++        Addr, (D->Type == EfiConventionalMemory) ? "free" : "firmware");
++      FreePool (Map);
++      return !EFI_ERROR (PublishRange (Addr, Addr + Size));
++    }
++  }
++
++  FreePool (Map);
++  RdSay (L"UNIXNURAMDISK: FAT payload not found in any RAM window\r\n");
++  return FALSE;
+ }
+
+ EFI_STATUS
+@@ -198,10 +452,18 @@
+ {
+   EFI_HOB_GUID_TYPE  *Hob;
+   UINT64             Dtb;
++  CONST VOID         *StartProp;
++  CONST VOID         *EndProp;
++  INT32              StartLength;
++  INT32              EndLength;
++  INT32              Chosen;
++  UINT64             Start;
++  UINT64             End;
+
+   Hob = GetFirstGuidHob (&mEntryArgHobGuid);
+   if (Hob == NULL) {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no entry argument HOB\n"));
++    RdSay (L"UNIXNURAMDISK: no entry argument HOB\r\n");
++    ScanFatPayload ();
+     return EFI_SUCCESS;
+   }
+
+@@ -210,13 +472,68 @@
+   }
+
+   Dtb = ReadUnaligned64 ((CONST UINT64 *)GET_GUID_HOB_DATA (Hob));
++  Print (L"UNIXNURAMDISK: x0 = 0x%lx\r\n", Dtb);
++
+   if ((Dtb == 0) || ((Dtb & 3) != 0) || (FdtCheckHeader ((VOID *)(UINTN)Dtb) != 0)) {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: x0 0x%lx is not a device tree\n", Dtb));
++    RdSay (L"UNIXNURAMDISK: x0 is not a device tree; using scan\r\n");
++    ScanFatPayload ();
+     return EFI_SUCCESS;
+   }
+
+-  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: device tree at 0x%lx, %u bytes\n", Dtb, (UINT32)FdtTotalSize ((VOID *)(UINTN)Dtb)));
+-
+-  PublishInitrd ((VOID *)(UINTN)Dtb);
+-  return EFI_SUCCESS;
+-}
++  Print (L"UNIXNURAMDISK: device tree at 0x%lx, %u bytes\r\n", Dtb,
++    (UINT32)FdtTotalSize ((VOID *)(UINTN)Dtb));
++
++  Chosen = FdtPathOffset ((VOID *)(UINTN)Dtb, "/chosen");
++  if (Chosen < 0) {
++    RdSay (L"UNIXNURAMDISK: no /chosen; using scan\r\n");
++    ScanFatPayload ();
++    return EFI_SUCCESS;
++  }
++
++  StartProp = FdtGetProp ((VOID *)(UINTN)Dtb, Chosen, "linux,initrd-start", &StartLength);
++  EndProp   = FdtGetProp ((VOID *)(UINTN)Dtb, Chosen, "linux,initrd-end", &EndLength);
++  if ((StartProp == NULL) || (EndProp == NULL) ||
++      ((StartLength != 4) && (StartLength != 8)) || ((EndLength != 4) && (EndLength != 8)))
++  {
++    RdSay (L"UNIXNURAMDISK: no initrd in /chosen; using scan\r\n");
++    ScanFatPayload ();
++    return EFI_SUCCESS;
++  }
++
++  Start = ReadCells (StartProp, StartLength / 4);
++  End   = ReadCells (EndProp, EndLength / 4);
++  Print (L"UNIXNURAMDISK: initrd 0x%lx-0x%lx (%lu MiB) from /chosen\r\n",
++    Start, End, (End - Start) >> 20);
++
++  //
++  // The ABL initrd span also carries its own content: find our FAT volume
++  // inside the span and publish from the real boot sector.
++  //
++  {
++    UINT64  FatSize;
++
++    UINT64 Fat = ScanRangeForFat (Start, End, &FatSize);
++    if (Fat != 0) {
++      Print (L"UNIXNURAMDISK: FAT payload at 0x%lx (offset +0x%lx in initrd)\r\n",
++        Fat, Fat - Start);
++      ThorProtectRange (Fat, FatSize);
++      if (!EFI_ERROR (PublishRange (Fat, Fat + FatSize))) {
++        ThorSelfTest ();
++      } else {
++        ScanFatPayload ();
++      }
++
++      return EFI_SUCCESS;
++    }
++
++    RdSay (L"UNIXNURAMDISK: FAT volume not inside /chosen initrd; trying /chosen start\r\n");
++    ThorProtectRange (Start, End - Start);
++    if (!EFI_ERROR (PublishRange (Start, End))) {
++      ThorSelfTest ();
++    } else {
++      ScanFatPayload ();
++    }
++
++    return EFI_SUCCESS;
++  }
++}
+diff --git a/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf b/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf
+--- a/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf
++++ b/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.inf
+@@ -18,8 +18,10 @@
+   DebugLib
+   FdtLib
+   HobLib
++  MemoryAllocationLib
+   UefiBootServicesTableLib
+   UefiDriverEntryPoint
++  UefiLib
+
+ [Protocols]
+   gEfiBlockIoProtocolGuid                       ## PRODUCES
+diff --git a/UniXNUPkg/Library/UniXNULib/Config.c b/UniXNUPkg/Library/UniXNULib/Config.c
+--- a/UniXNUPkg/Library/UniXNULib/Config.c
++++ b/UniXNUPkg/Library/UniXNULib/Config.c
+@@ -1493,6 +1493,55 @@
+   }
+ }
+
++//
++// THOR: walk \\EFI -> \\EFI\\UniXNU -> the config file and record the first
++// component that is missing, plus a few root directory names, so the menu's
++// error line shows WHY the config was not found on a mounted volume.
++//
++STATIC
++VOID
++ThorDiagnoseConfigPath (
++  IN UNIXNU_CONFIG  *Config,
++  IN EFI_HANDLE     Volume
++  )
++{
++  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *Fs;
++  EFI_FILE_PROTOCOL                *Root;
++  EFI_FILE_PROTOCOL                *Dir;
++  EFI_STATUS                       Status;
++
++  //
++  // Open the volume with our own handles: Volume.c's helpers are file-local.
++  //
++  Fs = NULL;
++  Root = NULL;
++  if (EFI_ERROR (gBS->HandleProtocol (Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs)) ||
++      (Fs == NULL) || EFI_ERROR (Fs->OpenVolume (Fs, &Root)))
++  {
++    ConfigError (Config, "volume open failed");
++    return;
++  }
++
++  Status = Root->Open (Root, &Dir, L"\\EFI", EFI_FILE_MODE_READ, 0);
++  if (EFI_ERROR (Status)) {
++    ConfigError (Config, "no \\EFI on volume (%r)", Status);
++    Root->Close (Root);
++    return;
++  }
++
++  Status = Dir->Open (Dir, &Root, L"UniXNU", EFI_FILE_MODE_READ, 0);
++  if (EFI_ERROR (Status)) {
++    Dir->Close (Dir);
++    Root->Close (Root);
++    ConfigError (Config, "\\EFI ok, UniXNU dir %r", Status);
++    return;
++  }
++
++  Root->Close (Root);
++  Dir->Close (Dir);
++  ConfigError (Config, "\\EFI\\UniXNU ok, unixnu.toml %r", Status);
++}
++
+ STATIC
+ BOOLEAN
+ TryVolume (
+@@ -1508,6 +1557,26 @@
+
+   Status = UniXNUReadFile (Volume, (CONST CHAR16 *)PcdGetPtr (PcdUniXNUConfigPath), (VOID **)&Text, &Size);
+   if (EFI_ERROR (Status)) {
++    //
++    // THOR: EFI_NOT_FOUND on every volume is normal (no config there), and
++    // EFI_UNSUPPORTED is the normal "no filesystem on this handle" answer for
++    // the application's own device handle. Anything else means a real volume
++    // exists but the read failed - record it so the menu shows it. Recording
++    // the benign codes here would set Config->Error and make ConfigLoad skip
++    // the remaining volumes entirely. On a real volume a NOT_FOUND gets a
++    // component-level diagnosis instead of silence.
++    //
++    if ((Status == EFI_NOT_FOUND) &&
++        !EFI_ERROR (gBS->HandleProtocol (Volume, &gEfiSimpleFileSystemProtocolGuid, NULL)))
++    {
++      ThorDiagnoseConfigPath (Config, Volume);
++      return FALSE;
++    }
++
++    if ((Status != EFI_NOT_FOUND) && (Status != EFI_UNSUPPORTED)) {
++      ConfigError (Config, "config read %r", Status);
++    }
++
+     return FALSE;
+   }
+
+diff --git a/UniXNUPkg/Library/UniXNULib/Main.c b/UniXNUPkg/Library/UniXNULib/Main.c
+--- a/UniXNUPkg/Library/UniXNULib/Main.c
++++ b/UniXNUPkg/Library/UniXNULib/Main.c
+@@ -61,6 +61,8 @@
+   BOOLEAN          Countdown;
+   UNIXNU_ENTRY         *Entry;
+   UNIXNU_ENTRY         BootCopy;
++  UINTN            VolumeCount;
++  UINTN            DiskIoCount;
+
+   //
+   // A boot manager waits for people; the 5 minute BDS watchdog does not.
+@@ -76,13 +78,54 @@
+     );
+
+   //
+-  // Started straight from BDS, storage may not be connected yet.
+-  //
+-  if (Host == UniXNUHostFirmware) {
+-    UniXNUConnectAll ();
++  // Storage may not be connected yet, whichever way UniXNU was entered. Started
++  // from BDS it is because nothing has connected the controllers; started as a
++  // DXE driver it is because the ramdisk BlockIo is dispatched before
++  // UniXNURamDiskDxe installs it, so without this the initrd volume never gets a
++  // SimpleFileSystem and payload discovery reports that no payload exists.
++  //
++  UniXNUConnectAll ();
++
++  //
++  // THOR: the menu repaints the whole screen, so anything printed to the
++  // console before it is erased. Count the mounted volumes and DiskIo
++  // instances here and carry the numbers into the menu's own info line
++  // instead: diskio > 0 + volumes 0 means Fat never bound; diskio 0 means
++  // DiskIo never bound to the ramdisk BlockIo.
++  //
++  {
++    EFI_HANDLE  *Volumes = NULL;
++    EFI_HANDLE  *Disks   = NULL;
++
++    VolumeCount = 0;
++    DiskIoCount = 0;
++    if (!EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid, NULL, &VolumeCount, &Volumes))) {
++      gBS->FreePool (Volumes);
++    } else {
++      VolumeCount = 0;
++    }
++
++    if (!EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &gEfiDiskIoProtocolGuid, NULL, &DiskIoCount, &Disks))) {
++      gBS->FreePool (Disks);
++    } else {
++      DiskIoCount = 0;
++    }
+   }
+
+   UniXNUConfigLoad (ImageHandle, &Config);
++
++  //
++  // THOR: append the storage census to whatever notice the config loader
++  // produced, so the binding state is readable in the single red line the
++  // operator always reports.
++  //
++  if (Config.Notice[0] != '\0') {
++    CHAR8  Census[48];
++
++    AsciiSPrint (Census, sizeof (Census), " [volumes %u diskio %u]",
++      (UINT32)VolumeCount, (UINT32)DiskIoCount);
++    AsciiStrCatS (Config.Notice, sizeof (Config.Notice), Census);
++  }
+   UniXNULog (
+     "config: %u entries, %u drivers, %u dt patches, %u acpi tables, %u slices, %u kits loaded, %u skipped",
+     (UINT32)Config.EntryCount,
+@@ -106,15 +149,31 @@
+
+   UniXNUUiInit (&Config, &Ui);
+
+-  UnicodeSPrint (
+-    Ui.Info,
+-    sizeof (Ui.Info),
+-    L"drivers %u loaded / %u failed    kits %u    acpi %u",
+-    (UINT32)Stats.DriversLoaded,
+-    (UINT32)Stats.DriversFailed,
+-    (UINT32)Config.KitsLoaded,
+-    (UINT32)Stats.AcpiInstalled
+-    );
++  //
++  // THOR: same count for DiskIo - the link between our BlockIo and Fat.
++  //
++  {
++    EFI_HANDLE  *Disks = NULL;
++    UINTN       DiskCount = 0;
++
++    if (!EFI_ERROR (gBS->LocateHandleBuffer (ByProtocol, &gEfiDiskIoProtocolGuid, NULL, &DiskCount, &Disks))) {
++      gBS->FreePool (Disks);
++    } else {
++      DiskCount = 0;
++    }
++
++    UnicodeSPrint (
++      Ui.Info,
++      sizeof (Ui.Info),
++      L"drivers %u loaded / %u failed    kits %u    acpi %u    volumes %u diskio %u",
++      (UINT32)Stats.DriversLoaded,
++      (UINT32)Stats.DriversFailed,
++      (UINT32)Config.KitsLoaded,
++      (UINT32)Stats.AcpiInstalled,
++      (UINT32)VolumeCount,
++      (UINT32)DiskCount
++      );
++  }
+
+   Countdown = TRUE;
+   for ( ; ;) {
+diff --git a/UniXNUPkg/Library/UniXNULib/UniXNULib.inf b/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+--- a/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
++++ b/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+@@ -54,6 +54,7 @@
+ [Protocols]
+   gEfiAcpiTableProtocolGuid         ## SOMETIMES_CONSUMES
+   gEfiBlockIoProtocolGuid           ## SOMETIMES_CONSUMES ## SOMETIMES_PRODUCES
++  gEfiDiskIoProtocolGuid            ## SOMETIMES_CONSUMES
+   gEfiPartitionInfoProtocolGuid     ## SOMETIMES_CONSUMES
+   gEfiDevicePathProtocolGuid        ## CONSUMES
+   gEfiFirmwareVolume2ProtocolGuid   ## SOMETIMES_CONSUMES
